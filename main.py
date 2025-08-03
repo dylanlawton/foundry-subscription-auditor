@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 import os
 from az_reader import list_resource_groups
 from ai_analyzer import analyze_resource_group
+from network_reader import list_virtual_networks
 
 # Load environment variables from .env file
 load_dotenv()
@@ -30,3 +31,11 @@ for group in group_data:
     # AI-generated analysis
     ai_summary = analyze_resource_group(group)
     print(f"  AI Analysis: {ai_summary}\n")
+
+# --- Networking analysis ---
+print("\nAuditing Virtual Networks:")
+vnets = list_virtual_networks(subscription_id)
+for vnet in vnets:
+    print(f"VNet: {vnet['name']}")
+    print(f"  Location: {vnet['location']}")
+    print(f"  Address Space: {vnet['address_space']}\n")
