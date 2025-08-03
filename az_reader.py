@@ -1,22 +1,18 @@
-# az_reader.py
-from azure.identity import AzureCliCredential
+from azure.identity import InteractiveBrowserCredential
 from azure.mgmt.resource import ResourceManagementClient
+import os
 
-def list_resource_groups(subscription_id: str):
-    credential = AzureCliCredential()
+def list_resource_groups(subscription_id):
+    credential = InteractiveBrowserCredential(tenant_id=os.getenv("AZURE_TENANT_ID"))
     client = ResourceManagementClient(credential, subscription_id)
     groups = client.resource_groups.list()
 
-    group_details = []
+    result = []
     for g in groups:
-        # Count the number of resources in the group
-        resource_count = len(list(client.resources.list_by_resource_group(g.name)))
-        
-        group_details.append({
+        result.append({
             "name": g.name,
             "location": g.location,
             "tags": g.tags or {},
-            "resource_count": resource_count
+            "resource_count": 0  # You can update this to count actual resources later
         })
-
-    return group_details
+    return result
