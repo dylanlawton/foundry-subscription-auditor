@@ -2,40 +2,25 @@
 
 from dotenv import load_dotenv
 import os
-from az_reader import list_resource_groups
-from ai_analyzer import analyze_resource_group
-from network_reader import list_virtual_networks
+from azure.identity import InteractiveBrowserCredential
 
-# Load environment variables from .env file
+from rg_reader import audit_resource_groups
+from network_reader import audit_virtual_networks
+
+# Load environment variables
 load_dotenv()
 
-# Get Azure subscription ID from environment
 subscription_id = os.getenv("AZURE_SUBSCRIPTION_ID")
+tenant_id = os.getenv("AZURE_TENANT_ID")
 
-# Confirm subscription ID is set
-if not subscription_id:
-    raise ValueError("AZURE_SUBSCRIPTION_ID not found in environment variables.")
+if not subscription_id or not tenant_id:
+    raise ValueError("Missing AZURE_SUBSCRIPTION_ID or AZURE_TENANT_ID in environment variables.")
 
-print(f"Checking resource groups in subscription: {subscription_id}\n")
+# Authenticate once
+credential = InteractiveBrowserCredential(tenant_id=tenant_id)
 
-# Get list of resource groups
-group_data = list_resource_groups(subscription_id)
+print(f"\nAuditing Azure Subscription: {subscription_id}\n")
 
-# Output and analyze each group
-for group in group_data:
-    print(f"Resource Group: {group['name']}")
-    print(f"  Location: {group['location']}")
-    print(f"  Resource Count: {group['resource_count']}")
-    print(f"  Tags: {group['tags']}")
-
-    # AI-generated analysis
-    ai_summary = analyze_resource_group(group)
-    print(f"  AI Analysis: {ai_summary}\n")
-
-# --- Networking analysis ---
-print("\nAuditing Virtual Networks:")
-vnets = list_virtual_networks(subscription_id)
-for vnet in vnets:
-    print(f"VNet: {vnet['name']}")
-    print(f"  Location: {vnet['location']}")
-    print(f"  Address Space: {vnet['address_space']}\n")
+# Run audits
+audit_resource_groups(subscription_id, credential)
+audit_virtual_networks(subscription_id, credential)
