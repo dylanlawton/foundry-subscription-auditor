@@ -1,9 +1,7 @@
-# ai_analyzer.py
-
 import os
 from openai import AzureOpenAI
 
-# Store client and deployment as globals (but don't initialize yet)
+# Store client and deployment as globals
 client = None
 deployment = None
 
@@ -22,6 +20,17 @@ def _ensure_client():
             api_version="2024-02-15-preview",
             azure_endpoint=endpoint
         )
+
+def _call_openai(prompt):
+    response = client.chat.completions.create(
+        model=deployment,
+        messages=[
+            {"role": "system", "content": "You are an expert in Azure architecture, networking, and governance."},
+            {"role": "user", "content": prompt}
+        ]
+    )
+    return response.choices[0].message.content.strip()
+
 
 def analyze_resource_group(group):
     _ensure_client()
@@ -43,30 +52,33 @@ def analyze_resource_group(group):
 
     return _call_openai(prompt)
 
-def analyze_virtual_network(vnet):
+
+def analyze_virtual_network_detailed(vnet_details):
     _ensure_client()
 
+    subnet_details = "\n".join([
+        f"    - {sn['name']}: NSG = {sn['nsg']}, UDR = {sn['udr']}"
+        for sn in vnet_details['subnets']
+    ]) or "None"
+
     prompt = (
-        f"You are an Azure networking expert. Analyze the following virtual network configuration:\n\n"
-        f"Name: {vnet['name']}\n"
-        f"Location: {vnet['location']}\n"
-        f"Address Space: {vnet['address_space']}\n\n"
-        f"Please include in your summary:\n"
-        f"- If the name follows Azure naming conventions\n"
-        f"- Whether the address space looks typical or overly broad\n"
-        f"- Any governance, security, or segmentation considerations\n"
-        f"- Is this typical of good/best practice in enterprise Azure networking\n"
-        f"Keep your feedback concise and clear."
+        f"Analyze this Azure Virtual Network configuration for best practices and governance:\n\n"
+        f"Name: {vnet_details['name']}\n"
+        f"Location: {vnet_details['location']}\n"
+        f"Address Space: {vnet_details['address_space']}\n"
+        f"Peered: {vnet_details['peered']}\n"
+        f"Subnets:\n{subnet_details}\n"
+        f"Has Azure Firewall: {vnet_details['has_firewall']}\n"
+        f"Has ExpressRoute: {vnet_details['expressroute']}\n"
+        f"Has Gateway: {vnet_details['has_gateway']}\n"
+        f"Site-to-Site VPN: {vnet_details['site_to_site_vpn']}\n\n"
+        f"Please comment on:\n"
+        f"- Naming convention and address space size\n"
+        f"- Whether NSGs and UDRs are appropriately applied\n"
+        f"- Whether segmentation, routing, and peering follow best practice\n"
+        f"- Whether the presence or absence of ExpressRoute, Gateway, or Firewall aligns with good enterprise design\n"
+        f"- Any risks or recommendations for improvement\n"
+        f"Provide a clear and concise summary."
     )
 
     return _call_openai(prompt)
-
-def _call_openai(prompt):
-    response = client.chat.completions.create(
-        model=deployment,
-        messages=[
-            {"role": "system", "content": "You are an expert in Azure architecture, networking, and governance."},
-            {"role": "user", "content": prompt}
-        ]
-    )
-    return response.choices[0].message.content.strip()

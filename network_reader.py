@@ -1,5 +1,5 @@
 from azure.mgmt.network import NetworkManagementClient
-from ai_analyzer import analyze_virtual_network
+from ai_analyzer import analyze_virtual_network_detailed
 
 def audit_virtual_networks(subscription_id, credential):
     client = NetworkManagementClient(credential, subscription_id)
@@ -11,8 +11,12 @@ def audit_virtual_networks(subscription_id, credential):
         vnet_name = vnet.name
         rg_name = vnet.id.split("/")[4]
         address_space = vnet.address_space.address_prefixes
-        peerings = list(client.virtual_network_peerings.list(rg_name, vnet_name))
 
+        # Peering
+        peerings = list(client.virtual_network_peerings.list(rg_name, vnet_name))
+        is_peered = len(peerings) > 0
+
+        # Subnet NSG and UDR
         subnet_info = []
         for subnet in client.subnets.list(rg_name, vnet_name):
             subnet_data = {
@@ -22,21 +26,43 @@ def audit_virtual_networks(subscription_id, credential):
             }
             subnet_info.append(subnet_data)
 
-        # Print basic details
+        # Azure Firewall detection
+        firewalls = list(client.azure_firewalls.list_all())
+        has_firewall = any(fw.location == vnet.location for fw in firewalls)
+
+        # ExpressRoute circuits
+        circuits = list(client.express_route_circuits.list_all())
+        has_expressroute = any(circuit.location == vnet.location for circuit in circuits)
+
+        # Virtual Network Gateway (VPN / ExpressRoute Gateway)
+        gateways = list(client.virtual_network_gateways.list(rg_name))
+        has_vnet_gateway = any(gw.location == vnet.location for gw in gateways)
+        has_site_to_site_vpn = any(gw.gateway_type == "Vpn" and "VpnClientConfiguration" in str(gw) for gw in gateways)
+
+        # Print core info
         print(f"VNet: {vnet_name}")
         print(f"  Location: {vnet.location}")
         print(f"  Address Space: {address_space}")
-        print(f"  Peered: {'Yes' if peerings else 'No'}")
-        print(f"  Subnets:")
+        print(f"  Peered: {'Yes' if is_peered else 'No'}")
+        print(f"  Has Azure Firewall: {'Yes' if has_firewall else 'No'}")
+        print(f"  Has ExpressRoute: {'Yes' if has_expressroute else 'No'}")
+        print(f"  Has VNet Gateway: {'Yes' if has_vnet_gateway else 'No'}")
+        print(f"  Site-to-Site VPN Configured: {'Yes' if has_site_to_site_vpn else 'No'}")
+        print("  Subnets:")
         for sn in subnet_info:
             print(f"    - {sn['name']}: NSG = {sn['nsg']}, UDR = {sn['udr']}")
 
-        # AI Analysis
-        ai_summary = analyze_virtual_network({
+        # Call AI analysis
+        ai_summary = analyze_virtual_network_detailed({
             "name": vnet_name,
             "location": vnet.location,
             "address_space": address_space,
-            "peered": bool(peerings),
-            "subnets": subnet_info
+            "peered": is_peered,
+            "subnets": subnet_info,
+            "has_firewall": has_firewall,
+            "expressroute": has_expressroute,
+            "has_gateway": has_vnet_gateway,
+            "site_to_site_vpn": has_site_to_site_vpn
         })
+
         print(f"  AI Analysis: {ai_summary}\n")
