@@ -1,5 +1,7 @@
 azure-identity
 azure-mgmt-resource
 python-dotenv
+azure-mgmt-compute
 openai
 azure-mgmt-network
+azure-mgmt-resourcegraph
