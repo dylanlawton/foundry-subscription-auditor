@@ -8,5 +8,4 @@ azure-mgmt-resourcegraph
 azure-mgmt-storage
 azure-mgmt-monitor
 azure-mgmt-storage
-azure-monitor-query
-azure-mgmt-sql    
+azure-monitor-query    
