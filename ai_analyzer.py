@@ -452,3 +452,47 @@ Guidance:
 - Do not use bullet points; cohesive prose only.
 """
     return _call_openai(prompt)
+
+def analyze_storage_section(storage_data: dict) -> str:
+    """
+    1–2 paragraphs summarising storage estate:
+    - Scale (accounts, kinds, SKUs), perf tier mix
+    - Exposure posture (publicNetworkAccess/defaultAction) + Private Endpoints
+    - Blob features (versioning, change feed, delete retention, static websites)
+    - Capacity (rough GB) and what the names imply about purpose
+    """
+    _ensure_client()
+    if not storage_data:
+        return "(No storage data.)"
+
+    s = storage_data.get("summary", {}) or {}
+    accts = storage_data.get("accounts", []) or []
+
+    total = int(s.get("total_accounts", 0))
+    kinds = s.get("kinds", {})
+    skus = s.get("skus", {})
+    pe_total = int(s.get("private_endpoint_accounts", 0))
+    public_allowed = int(s.get("public_allowed_accounts", 0))
+    ver_on = int(s.get("versioning_enabled_accounts", 0))
+    web_on = int(s.get("static_website_accounts", 0))
+    est_gb = float(s.get("est_total_used_gb", 0.0))
+    sample_names = ", ".join(a.get("name","") for a in accts[:8])
+
+    prompt = f"""
+You are an Azure storage architect. Write 1–2 tight paragraphs that characterise the storage estate.
+
+Context:
+- Accounts={total}, Kinds={kinds}, SKUs={skus}
+- PrivateEndpointConnections(total)={pe_total}, PublicAllowedAccounts≈{public_allowed}
+- BlobVersioningEnabledAccounts={ver_on}, StaticWebsiteAccounts={web_on}
+- EstimatedTotalUsedGB≈{est_gb}
+- SampleNames={sample_names}
+
+Guidance:
+- Infer likely workload mix from kind/SKU spread (e.g., Standard_LRS vs Premium, BlobStorage vs StorageV2).
+- Mention exposure posture: if many public-allowed, note internet exposure; if many PEs, highlight private link usage.
+- Call out data governance features: versioning/change feed/delete retention signalling immutability/forensics.
+- If static websites appear, infer lightweight web hosting or asset delivery.
+- Keep it cohesive prose; no bullet points; avoid restating raw numbers verbatim—interpret them.
+"""
+    return _call_openai(prompt)

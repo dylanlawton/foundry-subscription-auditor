@@ -5,3 +5,7 @@ azure-mgmt-compute
 openai
 azure-mgmt-network
 azure-mgmt-resourcegraph
+azure-mgmt-storage
+azure-mgmt-monitor
+azure-mgmt-storage
+azure-monitor-query

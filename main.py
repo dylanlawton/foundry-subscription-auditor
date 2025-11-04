@@ -8,6 +8,7 @@ from azure.identity import InteractiveBrowserCredential
 from rg_reader import audit_resource_groups, get_rg_details
 from network_reader import audit_virtual_networks, get_network_details
 from vm_reader import audit_virtual_machines, get_vm_details
+from storage_reader import audit_storage, get_storage_details
 from subscription_resources import audit_subscription_resources
 from ai_analyzer import (
     analyze_subscription_resources_overview,
@@ -15,6 +16,7 @@ from ai_analyzer import (
     analyze_network_section,
     analyze_rg_section,
     analyze_vm_section,
+    analyze_storage_section,
 )
 
 # ============================
@@ -47,6 +49,9 @@ def _write_text(path: str, text: str) -> None:
     with open(path, "w", encoding="utf-8") as f:
         f.write(text if text else "")
 
+def _fmt_bool(b) -> str:
+    return "Yes" if bool(b) else "No"
+
 # ============================
 # HTML sections
 # ============================
@@ -60,9 +65,9 @@ def _render_vm_section(ai_text: str, vm_data: dict, max_rows: int = 30) -> str:
     dsk = vm_data.get("disk_summary", {}) or {}
     vs  = vm_data.get("vmss_summary", {}) or {}
 
-    # quick summary line
     summary = (
-        f"Total VMs: {int(s.get('total_vms',0))} • "
+        f"Total VMs (all): {int(s.get('total_vms_all',0))} • "
+        f"Sampled: {int(s.get('total_vms',0))} • "
         f"Spot: {int(s.get('spot_vms',0))} • "
         f"AvSet-attached: {int(s.get('avset_attached_vms',0))} • "
         f"With Identity: {int(s.get('identity_vms',0))} • "
@@ -116,6 +121,76 @@ def _render_vm_section(ai_text: str, vm_data: dict, max_rows: int = 30) -> str:
     </div>
     """
 
+def _render_storage_section(ai_text: str, storage_data: dict, max_rows: int = 40) -> str:
+    if not storage_data:
+        return "<div class='section'><h2>Storage (detailed)</h2><p class='small'>No storage data.</p></div>"
+
+    s = storage_data.get("summary", {}) or {}
+    accs = storage_data.get("accounts", [])[:max_rows]
+
+    summary = (
+        f"Accounts: {int(s.get('total_accounts',0))} • "
+        f"Kinds: {s.get('kinds', {})} • "
+        f"SKUs: {s.get('skus', {})} • "
+        f"PE connections (total): {int(s.get('private_endpoint_accounts',0))} • "
+        f"Public-allowed accounts: {int(s.get('public_allowed_accounts',0))} • "
+        f"Versioning on: {int(s.get('versioning_enabled_accounts',0))} • "
+        f"Static sites: {int(s.get('static_website_accounts',0))} • "
+        f"Est. total used: {float(s.get('est_total_used_gb',0.0))} GB"
+    )
+
+    rows = []
+    for a in accs:
+        exposure = "PrivateOnly" if (str(a.get("public_network_access","")).lower()=="disabled" and str(a.get("network_default_action","")).lower()=="deny") else "PublicAllowed"
+        rows.append(
+            "<tr>"
+            f"<td><code>{_html_escape(a['name'])}</code></td>"
+            f"<td>{_html_escape(a['rg'])}</td>"
+            f"<td>{_html_escape(a['location'])}</td>"
+            f"<td>{_html_escape(a['kind'])}</td>"
+            f"<td>{_html_escape(a['sku'])}</td>"
+            f"<td>{_html_escape(a.get('access_tier',''))}</td>"
+            f"<td>{_html_escape(exposure)}</td>"
+            f"<td>{int(a['private_endpoint_count'])}</td>"
+            f"<td>{_html_escape('Yes' if a['blob_versioning'] else 'No')}</td>"
+            f"<td>{_html_escape('Yes' if a['static_website'] else 'No')}</td>"
+            f"<td>{a['used_gb']} GB</td>"
+            "</tr>"
+        )
+
+    table_html = (
+        "<p class='small'>No storage accounts found.</p>" if not rows else
+        f"""
+        <table>
+          <tr>
+            <th style="width:18%;">Account</th>
+            <th style="width:18%;">Resource Group</th>
+            <th style="width:10%;">Location</th>
+            <th style="width:10%;">Kind</th>
+            <th style="width:10%;">SKU</th>
+            <th style="width:8%;">Tier</th>
+            <th style="width:10%;">Exposure</th>
+            <th style="width:6%;">PEs</th>
+            <th style="width:6%;">Versioning</th>
+            <th style="width:6%;">Static</th>
+            <th style="width:8%;">Used</th>
+          </tr>
+          {''.join(rows)}
+        </table>
+        """
+    )
+
+    ai_html = f"<div class='ai'>{_html_escape(ai_text or '(No AI narrative)')}</div>"
+
+    return f"""
+    <div class="section">
+      <h2>Storage (detailed)</h2>
+      {ai_html}
+      <p class="small">{_html_escape(summary)}</p>
+      {table_html}
+    </div>
+    """
+
 def _render_network_section(ai_text: str, net_data: dict, max_rows: int = 25) -> str:
     if not net_data:
         return "<div class='section'><h2>Networking (detailed)</h2><p class='small'>No networking data.</p></div>"
@@ -123,7 +198,6 @@ def _render_network_section(ai_text: str, net_data: dict, max_rows: int = 25) ->
     counts = net_data.get("summary", {}).get("counts", {})
     vnets = net_data.get("vnets", [])[:max_rows]
 
-    # Summary bullets
     bullets = []
     for k in ["vnets","vnet_gateways","expressroute_circuits","private_endpoints",
               "private_dns_zones","nsgs","route_tables","application_gateways",
@@ -132,7 +206,6 @@ def _render_network_section(ai_text: str, net_data: dict, max_rows: int = 25) ->
             bullets.append(f"<li><b>{k.replace('_',' ').title()}</b>: {counts[k]}</li>")
     summary_ul = "<ul>" + "".join(bullets) + "</ul>"
 
-    # VNet table
     rows = []
     for v in vnets:
         sub_count = len(v.get("subnets", []) or [])
@@ -226,13 +299,12 @@ def _render_rg_section(ai_text: str, rg_data: dict, max_rows: int = 30) -> str:
     """
 
 def _render_html_report(subscription_id: str, rows: list, per_type_notes: dict,
-                        ai_summary: str, vm_ai: str, net_ai: str, rg_ai: str,
-                        vm_data: dict, net_data: dict, rg_data: dict,
+                        ai_summary: str, vm_ai: str, net_ai: str, rg_ai: str, storage_ai: str,
+                        vm_data: dict, net_data: dict, rg_data: dict, storage_data: dict,
                         generated_at: str) -> str:
     safe_sub = _html_escape(subscription_id)
     ai_html = _html_escape(ai_summary or "(No AI summary)")
 
-    # Inventory rows
     inv_tr = []
     for r in rows:
         rtype = str(r.get("type", ""))
@@ -253,6 +325,7 @@ def _render_html_report(subscription_id: str, rows: list, per_type_notes: dict,
     inv_rows = "\n".join(inv_tr) if inv_tr else "<tr><td colspan='4'>No data</td></tr>"
 
     vm_section  = _render_vm_section(vm_ai, vm_data)
+    storage_section = _render_storage_section(storage_ai, storage_data)
     net_section = _render_network_section(net_ai, net_data)
     rg_section  = _render_rg_section(rg_ai, rg_data)
 
@@ -293,6 +366,7 @@ td.narr {{ color:#111; }}
 </table>
 
 {vm_section}
+{storage_section}
 {net_section}
 {rg_section}
 
@@ -314,6 +388,7 @@ OUTPUT_DIR = os.getenv("OUTPUT_DIR", "outputs")
 MAX_VNETS = int(os.getenv("DETAIL_MAX_VNETS", "25"))
 MAX_RGS   = int(os.getenv("DETAIL_MAX_RGS", "30"))
 MAX_VMS   = int(os.getenv("DETAIL_MAX_VMS", "30"))
+MAX_STOR  = int(os.getenv("DETAIL_MAX_STORAGE", "200"))
 
 if not subscription_id or not tenant_id:
     raise ValueError("Missing AZURE_SUBSCRIPTION_ID or AZURE_TENANT_ID")
@@ -348,6 +423,12 @@ except Exception as e:
     vm_data = {}
 
 try:
+    storage_data = get_storage_details(subscription_id, credential, max_accounts=MAX_STOR)
+except Exception as e:
+    print(f"[WARN] Storage detail failed: {e}")
+    storage_data = {}
+
+try:
     net_data = get_network_details(subscription_id, credential, max_vnets=MAX_VNETS)
 except Exception as e:
     print(f"[WARN] Networking detail failed: {e}")
@@ -378,6 +459,11 @@ except Exception as e:
     vm_ai = f"(VM AI narrative unavailable: {e})"
 
 try:
+    storage_ai = analyze_storage_section(storage_data) if storage_data else "(No storage data to summarise.)"
+except Exception as e:
+    storage_ai = f"(Storage AI narrative unavailable: {e})"
+
+try:
     net_ai = analyze_network_section(net_data) if net_data else "(No networking data to summarise.)"
 except Exception as e:
     net_ai = f"(Networking AI narrative unavailable: {e})"
@@ -390,14 +476,19 @@ except Exception as e:
 # ---- Render ----
 report_html = _render_html_report(
     subscription_id, rows, per_type_notes,
-    ai_summary, vm_ai, net_ai, rg_ai,
-    vm_data, net_data, rg_data,
+    ai_summary, vm_ai, net_ai, rg_ai, storage_ai,
+    vm_data, net_data, rg_data, storage_data,
     _now_stamp()
 )
 _write_text(html_path, report_html)
 print(f"[INFO] HTML report generated: {html_path}")
 
-# ---- Console detailed audits (still available) ----
+# ---- Console detailed audits (optional)
+try:
+    audit_storage(subscription_id, credential)
+except Exception as e:
+    print(f"[WARN] Storage audit failed: {e}")
+
 try:
     audit_virtual_machines(subscription_id, credential)
 except Exception as e:
