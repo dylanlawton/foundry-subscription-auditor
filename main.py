@@ -11,6 +11,7 @@ from vm_reader import audit_virtual_machines, get_vm_details
 from storage_reader import audit_storage, get_storage_details
 from subscription_resources import audit_subscription_resources
 from ai_analyzer import (
+    set_prompt_context,
     analyze_subscription_resources_overview,
     describe_resource_types,
     analyze_network_section,
@@ -390,10 +391,15 @@ MAX_RGS   = int(os.getenv("DETAIL_MAX_RGS", "30"))
 MAX_VMS   = int(os.getenv("DETAIL_MAX_VMS", "30"))
 MAX_STOR  = int(os.getenv("DETAIL_MAX_STORAGE", "200"))
 
+REPORT_SYSTEM_PROMPT = os.getenv("REPORT_SYSTEM_PROMPT")
+REPORT_ANGLE_TEXT = os.getenv("REPORT_ANGLE_TEXT")
+
 if not subscription_id or not tenant_id:
     raise ValueError("Missing AZURE_SUBSCRIPTION_ID or AZURE_TENANT_ID")
 
 credential = InteractiveBrowserCredential(tenant_id=tenant_id)
+set_prompt_context(system_prompt=REPORT_SYSTEM_PROMPT, angle_text=REPORT_ANGLE_TEXT)
+
 print(f"\nAuditing Azure Subscription: {subscription_id}\n")
 
 _ensure_dir(OUTPUT_DIR)

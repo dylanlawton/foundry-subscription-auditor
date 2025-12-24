@@ -1,11 +1,44 @@
 # ai_analyzer.py
 
 import os
+from typing import Optional
 from openai import AzureOpenAI
 
 # Store client and deployment as globals
 client = None
 deployment = None
+
+# Default prompt context (can be overridden by the caller)
+DEFAULT_SYSTEM_PROMPT = (
+    "You are an expert in Azure architecture, networking, and governance. "
+    "You write concise, executive-friendly summaries with concrete, defensible inferences."
+)
+
+# Optional overrides (set once per run by main.py / caller)
+_SYSTEM_PROMPT_OVERRIDE: Optional[str] = None
+_ANGLE_TEXT: Optional[str] = None
+
+
+def set_prompt_context(system_prompt: Optional[str] = None, angle_text: Optional[str] = None) -> None:
+    """Set (optional) prompt context for this run.
+
+    - system_prompt: overrides the default system prompt when provided
+    - angle_text: appended to every user prompt as extra steering context when provided
+    """
+    global _SYSTEM_PROMPT_OVERRIDE, _ANGLE_TEXT
+    _SYSTEM_PROMPT_OVERRIDE = system_prompt.strip() if system_prompt and system_prompt.strip() else None
+    _ANGLE_TEXT = angle_text.strip() if angle_text and angle_text.strip() else None
+
+
+def _resolved_system_prompt() -> str:
+    # explicit set_prompt_context() wins; otherwise allow env var; otherwise default.
+    return _SYSTEM_PROMPT_OVERRIDE or os.getenv("REPORT_SYSTEM_PROMPT") or DEFAULT_SYSTEM_PROMPT
+
+
+def _resolved_angle_text() -> Optional[str]:
+    # explicit set_prompt_context() wins; otherwise allow env var.
+    return _ANGLE_TEXT or (os.getenv("REPORT_ANGLE_TEXT") or None)
+
 
 def _ensure_client():
     global client, deployment
@@ -23,15 +56,35 @@ def _ensure_client():
             azure_endpoint=endpoint
         )
 
+
 def _call_openai(prompt: str) -> str:
+    """Send a single prompt to the configured Azure OpenAI chat deployment.
+
+    Uses:
+      - a default system prompt (or override via set_prompt_context / REPORT_SYSTEM_PROMPT)
+      - optional angle text appended to the user prompt (set_prompt_context / REPORT_ANGLE_TEXT)
+    """
+    system_prompt = _resolved_system_prompt()
+    angle_text = _resolved_angle_text()
+
+    user_content = prompt
+    if angle_text:
+        user_content = (
+            f"{prompt}\n\n"
+            f"---\n"
+            f"Additional report angle / stakeholder context (apply consistently):\n"
+            f"{angle_text}\n"
+        )
+
     response = client.chat.completions.create(
         model=deployment,
         messages=[
-            {"role": "system", "content": "You are an expert in Azure architecture, networking, and governance. You write concise, executive-friendly summaries with concrete, defensible inferences."},
-            {"role": "user", "content": prompt}
-        ]
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_content},
+        ],
     )
     return response.choices[0].message.content.strip()
+
 
 # ---------------- Existing analyzers (RG + VNET) ----------------
 
@@ -56,6 +109,7 @@ def analyze_resource_group(group: dict) -> str:
         f"Keep your summary clear, concise, and actionable."
     )
     return _call_openai(prompt)
+
 
 def analyze_virtual_network_detailed(vnet_details: dict) -> str:
     _ensure_client()
@@ -84,6 +138,7 @@ def analyze_virtual_network_detailed(vnet_details: dict) -> str:
     )
     return _call_openai(prompt)
 
+
 # ---------------- Estate-level overview (uses headlines) ----------------
 
 def _index_counts(rows):
@@ -92,6 +147,7 @@ def _index_counts(rows):
         t = str(r.get("type", "")).lower()
         idx[t] = int(r.get("count", 0))
     return idx
+
 
 def _derive_estate_metrics(rows):
     c = _index_counts(rows)
@@ -142,6 +198,7 @@ def _derive_estate_metrics(rows):
         "security": security,
     }
 
+
 _HEADLINE_WEIGHTS = {
     "microsoft.network/expressroutecircuits": 10,
     "microsoft.network/virtualnetworkgateways": 9,
@@ -166,12 +223,14 @@ _HEADLINE_WEIGHTS = {
     "microsoft.applicationinsights/components": 6,
 }
 
+
 def _score_headline(rtype: str, count: int) -> float:
     from math import log10
     base = _HEADLINE_WEIGHTS.get(rtype.lower(), 1)
     if count <= 0:
         return 0.0
     return base * (1 + log10(max(1, count)))
+
 
 def _build_headline_snippets(rows, per_type_notes, max_items=10):
     scored = []
@@ -186,6 +245,7 @@ def _build_headline_snippets(rows, per_type_notes, max_items=10):
     top = scored[:max_items]
     lines = [f"- {t} ({c}): {note}" for _, t, c, note in top]
     return "\n".join(lines)
+
 
 def analyze_subscription_resources_overview(payload: dict) -> str:
     _ensure_client()
@@ -214,6 +274,7 @@ Context:
 """
     return _call_openai(prompt)
 
+
 # ---------------- Per-type narrative (for the main table) ----------------
 
 _TYPE_HINTS = {
@@ -237,262 +298,124 @@ _TYPE_HINTS = {
     "microsoft.operationalinsights/workspaces": "Log Analytics workspaces for centralised logs/metrics.",
     "microsoft.insights/components": "Application Insights for app telemetry & availability.",
     "microsoft.insights/metricalerts": "Metric-based alerts (CPU, latency, queue depth, etc.).",
-    "microsoft.insights/activitylogalerts": "Control-plane alerts (RBAC, policy, create/update/delete).",
-    "microsoft.insights/scheduledqueryrules": "Log query–driven alerts (KQL).",
-    "microsoft.insights/actiongroups": "Notification/automation targets for alerts (email, ITSM, webhook).",
-    "microsoft.insights/workbooks": "Interactive operational dashboards in Azure Monitor.",
-    "microsoft.insights/datacollectionrules": "DCRs for AMA-based data collection.",
-    "microsoft.insights/datacollectionendpoints": "Endpoints used by DCRs/AMA to route telemetry.",
-    "microsoft.recoveryservices/vaults": "Backup/ASR protection stores and policies.",
-    "microsoft.keyvault/vaults": "Secrets/keys/certs for apps and infra.",
-    "microsoft.resourcegraph/queries": "Saved KQL for inventory/ops insight.",
-    "microsoft.automation/automationaccounts": "Runbooks/schedules for ops automation.",
-    "microsoft.automation/automationaccounts/runbooks": "Automation scripts used by jobs/schedules.",
-    "microsoft.logic/workflows": "Logic Apps for integration & remediation flows.",
-    "microsoft.storage/storageaccounts": "General-purpose storage (VM disks, logs, app data, file shares).",
-    "microsoft.network/networkwatchers": "Regional Network Watcher instances for diagnostics.",
-    "microsoft.network/networkwatchers/flowlogs": "NSG flow logs for traffic analytics.",
-    "microsoft.network/virtualwans": "VWAN hub for scalable branch connectivity.",
-    "microsoft.network/virtualhubs": "VWAN hubs; centralised transit with routing.",
-    "microsoft.network/p2svpngateways": "Point-to-Site VPN access for users.",
-    "microsoft.migrate/*": "Azure Migrate artifacts for discovery/assessment/migration.",
-    "microsoft.offazure/*": "Azure Migrate (server/VMware master/import) for lift-and-shift.",
-    "microsoft.operationsmanagement/solutions": "Legacy OMS solutions (Update, Activity, VMInsights).",
-    "microsoft.portal/dashboards": "Shared Azure Portal dashboards.",
-    "microsoft.resources/templatespecs": "Reusable ARM/Bicep template specs (governance).",
-    "microsoft.resources/templatespecs/versions": "Versioned template specs for repeatable deployments.",
-    "microsoft.hybridcompute/machines": "Arc-enabled servers (non-Azure).",
-    "microsoft.hybridcompute/machines/extensions": "Arc extensions (monitoring/management on hybrid).",
-    "microsoft.sqlvirtualmachine/sqlvirtualmachines": "SQL IaaS extension–managed SQL VMs.",
-    "microsoft.eventhub/namespaces": "Event ingestion at scale (telemetry/streaming).",
-    "microsoft.alertsmanagement/smartdetectoralertrules": "AI smart detector alerts from App Insights.",
-    "microsoft.devtestlab/schedules": "Auto-shutdown schedules (DevTest labs / VMs).",
-    "microsoft.storagesync/storagesyncservices": "Azure File Sync management service.",
-    "microsoft.managedidentity/userassignedidentities": "User-assigned identities for workloads.",
-    "microsoft.visualstudio/account": "DevOps/VS subscriptions linkage.",
-    "microsoft.maintenance/maintenanceconfigurations": "Pinned maintenance windows on resources.",
-    "microsoft.compute/galleries": "Shared Image Gallery (SIG) for image distribution.",
-    "microsoft.compute/galleries/images": "Images published in SIG.",
-    "microsoft.compute/galleries/images/versions": "Versioned images in SIG.",
-    "microsoft.compute/images": "Managed images (legacy or bespoke builds).",
-    "microsoft.datareplication/replicationvaults": "Modern DR replication vaults.",
-    "microsoft.operationalinsights/querypacks": "Saved KQL query packs for reuse.",
+    "microsoft.insights/scheduledqueryrules": "Log alert rules; higher counts can mean mature monitoring or noisy alerting.",
+    "microsoft.recoveryservices/vaults": "Backup vaults for IaaS workloads; indicates protection baseline.",
+    "microsoft.keyvault/vaults": "Secrets/keys/certs; should usually be private-access and RBAC controlled.",
 }
 
-def _first_match_hint(rtype: str) -> str:
-    rtype_l = rtype.lower()
-    if rtype_l in _TYPE_HINTS:
-        return _TYPE_HINTS[rtype_l]
-    for k, v in _TYPE_HINTS.items():
-        if k.endswith("/*"):
-            prefix = k[:-2]
-            if rtype_l.startswith(prefix):
-                return v
-    return ""
 
-def _heuristic_tail(rtype: str, count: int, samples: list) -> str:
-    name_blob = " ".join(samples).lower() if samples else ""
-    extra = ""
-    if "privatelink" in rtype or "privateendpoints" in rtype or "privatelink" in name_blob:
-        extra = " Used to keep PaaS traffic on private IP space."
-    elif "virtualnetworkgateways" in rtype or "p2svpn" in rtype or "vpn" in name_blob:
-        extra = " Indicates site or user VPN connectivity."
-    elif "expressroute" in rtype:
-        extra = " Suggests private MPLS/ISP connectivity back to datacentres."
-    elif "applicationgateways" in rtype or "waf" in name_blob:
-        extra = " Implies HTTP(S) publishing with WAF options."
-    elif "sql" in rtype or "mssql" in name_blob:
-        extra = " Points to SQL workloads running on IaaS."
-    elif "automation" in rtype or "runbooks" in rtype:
-        extra = " Used for patching, start/stop, cleanup, or remediation."
-    elif "workbooks" in rtype:
-        extra = " Operations dashboards—consider consolidation."
-    elif "actiongroups" in rtype:
-        extra = " Notification endpoints for alerts; review for noise."
-    elif "metricalerts" in rtype or "scheduledqueryrules" in rtype:
-        extra = " Alert rules—check for duplication and threshold tuning."
-    elif "recoveryservices/vaults" in rtype:
-        extra = " Holds backup/ASR configs—verify coverage and retention."
-    elif "keyvault" in rtype:
-        extra = " Secrets/keys for apps; ensure RBAC and purge protection."
-    elif "privatednszones" in rtype:
-        extra = " Make sure zone-to-VNet links match Private Endpoints."
-    elif "networksecuritygroups" in rtype or "nsg" in name_blob:
-        extra = " Validate rules and ensure least-privilege."
-    elif "routetables" in rtype:
-        extra = " Custom routes should align with hub/spoke and NVAs."
-    return extra
+def _hint_for_type(rtype: str) -> str:
+    return _TYPE_HINTS.get((rtype or "").lower(), "")
+
 
 def describe_resource_types(rows: list) -> dict:
+    """
+    Create an AI narrative per resource type row:
+      { "microsoft.compute/virtualmachines": "Likely ...", ... }
+    """
+    _ensure_client()
     out = {}
-    for r in rows:
-        rtype = str(r.get("type", ""))
+    for r in rows or []:
+        rtype = str(r.get("type", "")).lower()
         count = int(r.get("count", 0))
         samples = r.get("sampleNames", []) or []
-        base = _first_match_hint(rtype)
-        if not base:
-            vendor = rtype.split("/")[0] if "/" in rtype else rtype
-            base = f"{vendor} resource type."
-        tail = _heuristic_tail(rtype, count, samples)
-        out[rtype.lower()] = f"{base} Count ≈ {count}.{tail}"
+        hint = _hint_for_type(rtype)
+
+        sample_txt = ", ".join(samples[:5]) if samples else ""
+        prompt = f"""
+In 1–2 sentences, explain what the Azure resource type below likely represents in an enterprise subscription,
+and what its presence/count implies. Keep it concrete and non-generic.
+
+Resource type: {rtype}
+Count: {count}
+Example names: {sample_txt}
+Optional hint (use if helpful, but do not repeat verbatim): {hint}
+"""
+        try:
+            out[rtype] = _call_openai(prompt)
+        except Exception as e:
+            out[rtype] = f"(AI note unavailable: {e})"
     return out
 
-# ---------------- NEW: AI narratives for detailed sections ----------------
 
-def analyze_network_section(net_data: dict) -> str:
-    """
-    1–2 paragraphs: describe the network posture (hub/spoke hints, ER/VPN, PE/PrivDNS, NSG/UDR density),
-    peering presence, and call out likely operational priorities.
-    """
-    _ensure_client()
-    counts = net_data.get("summary", {}).get("counts", {}) if net_data else {}
-    vnets = net_data.get("vnets", []) if net_data else []
-
-    # Cheap signals for peering prevalence, gateways, firewalls, etc.
-    peered = sum(1 for v in vnets if v.get("peered"))
-    gateways = counts.get("vnet_gateways", 0)
-    ers = counts.get("expressroute_circuits", 0)
-    pes = counts.get("private_endpoints", 0)
-    privdns = counts.get("private_dns_zones", 0)
-    nsgs = counts.get("nsgs", 0)
-    udrs = counts.get("route_tables", 0)
-    firewalls = counts.get("azure_firewalls", 0)
-    appgws = counts.get("application_gateways", 0)
-    lbs = counts.get("load_balancers", 0)
-    pips = counts.get("public_ips", 0)
-    vnets_ct = counts.get("vnets", len(vnets))
-
-    prompt = f"""
-You are an Azure networking architect. Write 1–2 concise paragraphs that describe the networking posture.
-
-Context (counts):
-- VNets={vnets_ct}, PeeredVNets≈{peered}, VNetGateways={gateways}, ExpressRoute={ers}
-- PrivateEndpoints={pes}, PrivateDNSZones={privdns}
-- NSGs={nsgs}, UDRs={udrs}, AzureFirewalls={firewalls}
-- AppGateways={appgws}, LoadBalancers={lbs}, PublicIPs={pips}
-
-Hints:
-- If ExpressRoute or VNet gateways exist, infer hybrid connectivity and likely hub/spoke.
-- If many Private Endpoints & Private DNS zones, infer Private Link usage for PaaS isolation.
-- If NSGs/UDRs are numerous, mention micro-segmentation and custom routing via NVAs/firewall.
-- Comment briefly on Internet exposure if there are many Public IPs/App Gateways.
-- Keep it crisp; no lists; a couple of tight paragraphs only.
-"""
-    return _call_openai(prompt)
-
-def analyze_rg_section(rg_data: dict) -> str:
-    """
-    1–2 paragraphs: describe RG organization (count, spread, top types), tagging hygiene hints,
-    and whether the grouping suggests env-based, app-based, or platform-based organization.
-    """
-    _ensure_client()
-    total = rg_data.get("summary", {}).get("total_rgs", 0) if rg_data else 0
-    groups = rg_data.get("groups", []) if rg_data else []
-
-    # Simple tag signal and top-type signal
-    with_tags = sum(1 for g in groups if g.get("tags") and g["tags"] != "None")
-    top_types_examples = ", ".join(g.get("top_types","") for g in groups[:8] if g.get("top_types"))
-
-    prompt = f"""
-You are an Azure governance expert. Write 1–2 concise paragraphs that describe how resource groups are organised and what it implies.
-
-Context:
-- TotalRGs={total}, RGsWithAnyTags≈{with_tags}
-- Examples of top resource types per RG (sampled): {top_types_examples}
-
-Hints:
-- If many RGs have tags, infer some level of tagging hygiene; otherwise call it out.
-- Use top types examples to infer whether grouping is app-centric, env-centric (dev/test/prod), or platform-centric (networking/security/shared).
-- Mention if high RG count likely reflects many projects or fragmentation; suggest consolidation if appropriate.
-- Keep it crisp; no lists; a couple of tight paragraphs only.
-"""
-    return _call_openai(prompt)
+# ---------------- Section summaries (VM/Storage/Network/RG) ----------------
 
 def analyze_vm_section(vm_data: dict) -> str:
-    """
-    1–2 paragraphs: describe VM estate scale, OS split, power state posture (idle/deallocated),
-    Spot usage, AvSet coverage, VMSS presence, and unattached disk risk. Keep crisp, no lists.
-    """
     _ensure_client()
-    if not vm_data:
-        return "(No VM data.)"
-
     s = vm_data.get("summary", {}) or {}
     d = vm_data.get("disk_summary", {}) or {}
     vs = vm_data.get("vmss_summary", {}) or {}
-
-    total_vms_all = int(s.get("total_vms_all", 0))
-    total_vms_sample = int(s.get("total_vms", 0))
-    os_counts = s.get("os_counts", {})
-    size_top  = s.get("size_top", [])
-    power     = s.get("power_counts", {})
-    spot      = int(s.get("spot_vms", 0))
-    avset_vm  = int(s.get("avset_attached_vms", 0))
-    identity  = int(s.get("identity_vms", 0))
-    total_disks = int(d.get("total_disks", 0))
-    unattached  = int(d.get("unattached_disks", 0))
-    vmss_count  = int(vs.get("count", 0))
-    sample_note = s.get("sample_note", "")
-
     prompt = f"""
-You are an Azure compute engineer. Write 1–2 concise paragraphs that characterise the VM estate.
+Summarise this Azure VM estate in 1–2 short paragraphs. Focus on governance signals and optimisation opportunities.
+Be factual and grounded in the numbers; no bullet lists.
 
-Context:
-- TotalVMs(all)={total_vms_all}, Sampled={total_vms_sample}, PowerStates(sample)={power}
-- SpotVMs(sample)={spot}, AvSetAttachedVMs(sample)={avset_vm}, WithIdentity(sample)={identity}
-- OSCounts(sample)={os_counts}, TopSizes(sample)={size_top}
-- VMScaleSets={vmss_count}
-- Disks: Total={total_disks}, Unattached={unattached}
-- Note: {sample_note}
-
-Guidance:
-- Ground statements in the ALL count for overall scale; derive composition from the sample.
-- If many deallocated/unknown states in the sample, mention potential optimisation (stop/deallocate, right-size).
-- Comment on Spot usage, availability posture (AvSets/VMSS), and unattached disks (cost & security).
-- Do not use bullet points; cohesive prose only.
+VM summary:
+- Total VMs (all): {s.get('total_vms_all')}
+- Sampled: {s.get('total_vms')}
+- OS split (sample): {s.get('os_counts')}
+- Top sizes (sample): {s.get('size_top')}
+- Power states (sample): {s.get('power_counts')}
+- Spot VMs (sample): {s.get('spot_vms')}
+- Availability-set attached VMs (sample): {s.get('avset_attached_vms')}
+- VMs with Managed Identity (sample): {s.get('identity_vms')}
+- VMSS count: {vs.get('count')}
+- Disks total: {d.get('total_disks')}, Unattached: {d.get('unattached_disks')}
 """
     return _call_openai(prompt)
 
+
 def analyze_storage_section(storage_data: dict) -> str:
-    """
-    1–2 paragraphs summarising storage estate:
-    - Scale (accounts, kinds, SKUs), perf tier mix
-    - Exposure posture (publicNetworkAccess/defaultAction) + Private Endpoints
-    - Blob features (versioning, change feed, delete retention, static websites)
-    - Capacity (rough GB) and what the names imply about purpose
-    """
     _ensure_client()
-    if not storage_data:
-        return "(No storage data.)"
-
     s = storage_data.get("summary", {}) or {}
-    accts = storage_data.get("accounts", []) or []
-
-    total = int(s.get("total_accounts", 0))
-    kinds = s.get("kinds", {})
-    skus = s.get("skus", {})
-    pe_total = int(s.get("private_endpoint_accounts", 0))
-    public_allowed = int(s.get("public_allowed_accounts", 0))
-    ver_on = int(s.get("versioning_enabled_accounts", 0))
-    web_on = int(s.get("static_website_accounts", 0))
-    est_gb = float(s.get("est_total_used_gb", 0.0))
-    sample_names = ", ".join(a.get("name","") for a in accts[:8])
-
     prompt = f"""
-You are an Azure storage architect. Write 1–2 tight paragraphs that characterise the storage estate.
+Summarise this Azure Storage estate in 1–2 short paragraphs. Emphasise security posture, exposure risk,
+and operational hygiene. Ground statements in the metrics; no bullet lists.
 
-Context:
-- Accounts={total}, Kinds={kinds}, SKUs={skus}
-- PrivateEndpointConnections(total)={pe_total}, PublicAllowedAccounts≈{public_allowed}
-- BlobVersioningEnabledAccounts={ver_on}, StaticWebsiteAccounts={web_on}
-- EstimatedTotalUsedGB≈{est_gb}
-- SampleNames={sample_names}
+Storage summary:
+- Total accounts: {s.get('total_accounts')}
+- Kinds: {s.get('kinds')}
+- SKUs: {s.get('skus')}
+- Private endpoint connections (accounts total): {s.get('private_endpoint_accounts')}
+- Public-allowed accounts: {s.get('public_allowed_accounts')}
+- Versioning enabled accounts: {s.get('versioning_enabled_accounts')}
+- Static website accounts: {s.get('static_website_accounts')}
+- Estimated total used GB: {s.get('est_total_used_gb')}
+"""
+    return _call_openai(prompt)
 
-Guidance:
-- Infer likely workload mix from kind/SKU spread (e.g., Standard_LRS vs Premium, BlobStorage vs StorageV2).
-- Mention exposure posture: if many public-allowed, note internet exposure; if many PEs, highlight private link usage.
-- Call out data governance features: versioning/change feed/delete retention signalling immutability/forensics.
-- If static websites appear, infer lightweight web hosting or asset delivery.
-- Keep it cohesive prose; no bullet points; avoid restating raw numbers verbatim—interpret them.
+
+def analyze_network_section(net_data: dict) -> str:
+    _ensure_client()
+    counts = net_data.get("summary", {}).get("counts", {}) or {}
+    prompt = f"""
+Summarise this Azure networking footprint in 1–2 short paragraphs. Focus on connectivity patterns,
+segmentation maturity, private access adoption, and internet exposure signals. No bullet lists.
+
+Network counts:
+{counts}
+"""
+    return _call_openai(prompt)
+
+
+def analyze_rg_section(rg_data: dict) -> str:
+    _ensure_client()
+    total = (rg_data.get("summary", {}) or {}).get("total_rgs")
+    groups = rg_data.get("groups", []) or []
+    top_samples = []
+    for g in groups[:8]:
+        top_samples.append({
+            "name": g.get("name"),
+            "location": g.get("location"),
+            "resource_count": g.get("resource_count"),
+            "top_types": g.get("top_types"),
+            "tags": g.get("tags"),
+        })
+    prompt = f"""
+Summarise resource group hygiene in 1–2 short paragraphs. Comment on naming, tagging consistency,
+and whether the grouping pattern suggests clear ownership or sprawl. No bullet lists.
+
+Total RGs: {total}
+Sample RGs (first {len(top_samples)}):
+{top_samples}
 """
     return _call_openai(prompt)
