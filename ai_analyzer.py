@@ -338,7 +338,7 @@ Optional hint (use if helpful, but do not repeat verbatim): {hint}
     return out
 
 
-# ---------------- Section summaries (VM/Storage/Network/RG) ----------------
+# ---------------- Section summaries (VM/Storage/Network/RG/Governance) ----------------
 
 def analyze_vm_section(vm_data: dict) -> str:
     _ensure_client()
@@ -417,5 +417,70 @@ and whether the grouping pattern suggests clear ownership or sprawl. No bullet l
 Total RGs: {total}
 Sample RGs (first {len(top_samples)}):
 {top_samples}
+"""
+    return _call_openai(prompt)
+
+
+def analyze_governance_security_cost_section(gsc_data: dict) -> str:
+    """
+    Updated to use the NEW cost shape:
+      cost["months"] = [{"month":"YYYY-MM","total": <number>}, ...]  (last 5 months)
+    and to stop feeding stale fields (month_to_date/last_full_month/trend/top_10) which caused hallucination.
+    """
+    _ensure_client()
+    sub = gsc_data.get("subscription", {}) or {}
+    mg  = gsc_data.get("management_group", {}) or {}
+    pol = gsc_data.get("policy", {}) or {}
+    cost= gsc_data.get("cost", {}) or {}
+    dfd = gsc_data.get("defender", {}) or {}
+
+    months = cost.get("months", []) or []
+    # build a compact, explicit line that the model must not contradict
+    month_lines = []
+    for m in months:
+        try:
+            mm = str(m.get("month", "") or "")
+            total = m.get("total", None)
+            if mm:
+                month_lines.append(f"- {mm}: {total}")
+        except Exception:
+            continue
+    months_text = "\n".join(month_lines) if month_lines else "(No monthly cost rows returned.)"
+
+    prompt = f"""
+Summarise this subscription’s Governance, Security & Cost posture in 1–2 short paragraphs.
+Keep it executive-friendly, grounded in the metrics, and avoid bullet lists.
+Call out practical next actions if gaps are obvious.
+
+CRITICAL ACCURACY REQUIREMENT:
+- The cost section below contains the authoritative last-5-month totals.
+- Do NOT claim "no spend" or "no costs" if any of the totals are non-zero.
+- If costs vary, describe the pattern (e.g., spike month) using the provided values.
+
+Subscription:
+- Display name: {sub.get('display_name')}
+- Subscription ID: {sub.get('subscription_id')}
+- Tenant ID: {sub.get('tenant_id')}
+- State: {sub.get('state')}
+
+Management Group:
+- Path: {mg.get('path')}
+- Leaf MG: {mg.get('leaf_mg')}
+- Note: {mg.get('note')}
+
+Policy:
+- Assignment count: {pol.get('assignment_count')}
+- Top initiatives (IDs): {(pol.get('top_initiatives') or [])[:5]}
+- Note: {pol.get('note')}
+
+Cost (authoritative last 5 months totals):
+{months_text}
+- Note: {cost.get('note')}
+
+Defender for Cloud:
+- Plans: {(dfd.get('plans') or [])[:10]}
+- Secure score: {dfd.get('secure_score')}
+- Alerts (best-effort): {dfd.get('alerts_last_30d')}
+- Note: {dfd.get('note')}
 """
     return _call_openai(prompt)

@@ -4,16 +4,19 @@ from typing import Dict, List, Any
 from azure.mgmt.network import NetworkManagementClient
 from azure.mgmt.resource import ResourceManagementClient
 
+
 def _safe(x):
     return x or ""
+
 
 def _id_to_rg(resource_id: str) -> str:
     # /subscriptions/.../resourceGroups/<rg-name>/...
     try:
         parts = resource_id.split("/")
-        return parts[parts.index("resourceGroups")+1]
+        return parts[parts.index("resourceGroups") + 1]
     except Exception:
         return ""
+
 
 def _list_by_type(subscription_id: str, credential, type_name: str) -> List[Any]:
     """
@@ -23,6 +26,7 @@ def _list_by_type(subscription_id: str, credential, type_name: str) -> List[Any]
     # Filter syntax: resourceType eq 'Microsoft.Network/virtualNetworkGateways'
     filt = f"resourceType eq '{type_name}'"
     return list(rm.resources.list(filter=filt))
+
 
 def get_network_details(subscription_id: str, credential, max_vnets: int = 50) -> Dict[str, Any]:
     """
@@ -36,25 +40,26 @@ def get_network_details(subscription_id: str, credential, max_vnets: int = 50) -
 
     # Subscription-wide counts via Network client where list_all exists
     try:
-        nsgs            = list(nclient.network_security_groups.list_all())
+        nsgs = list(nclient.network_security_groups.list_all())
     except Exception:
         nsgs = []
     try:
-        route_tables    = list(nclient.route_tables.list_all())
+        route_tables = list(nclient.route_tables.list_all())
     except Exception:
         route_tables = []
     try:
-        app_gateways    = list(nclient.application_gateways.list_all())
+        app_gateways = list(nclient.application_gateways.list_all())
     except Exception:
         app_gateways = []
     try:
-        load_balancers  = list(nclient.load_balancers.list_all())
+        load_balancers = list(nclient.load_balancers.list_all())
     except Exception:
         load_balancers = []
     try:
-        public_ips      = list(nclient.public_ip_addresses.list_all())
+        public_ips = list(nclient.public_ip_addresses.list_all())
     except Exception:
         public_ips = []
+
     # Azure Firewall (may not be registered in all subs)
     try:
         firewalls = list(nclient.azure_firewalls.list_all())
@@ -62,20 +67,22 @@ def get_network_details(subscription_id: str, credential, max_vnets: int = 50) -
         firewalls = []
 
     # Items that DO NOT have list_all() in the Network client (or live under a different RP):
-    gateways_res   = _list_by_type(subscription_id, credential, "Microsoft.Network/virtualNetworkGateways")
-    er_circuits_res= _list_by_type(subscription_id, credential, "Microsoft.Network/expressRouteCircuits")
+    gateways_res = _list_by_type(subscription_id, credential, "Microsoft.Network/virtualNetworkGateways")
+    er_circuits_res = _list_by_type(subscription_id, credential, "Microsoft.Network/expressRouteCircuits")
+
     # Private DNS lives under Microsoft.Network but in a separate client; use RM for reliability
-    priv_dns_res   = _list_by_type(subscription_id, credential, "Microsoft.Network/privateDnsZones")
+    priv_dns_res = _list_by_type(subscription_id, credential, "Microsoft.Network/privateDnsZones")
     priv_dns_links = _list_by_type(subscription_id, credential, "Microsoft.Network/privateDnsZones/virtualNetworkLinks")
+
     # Private Endpoints DO have list_all on Network client:
     try:
-        private_eps     = list(nclient.private_endpoints.list_all())
+        private_eps = list(nclient.private_endpoints.list_all())
     except Exception:
         private_eps = []
 
     # Build quick lookup sets for has_* heuristics
-    gateway_rg_loc = set(( _id_to_rg(g.id), getattr(g, "location", None) ) for g in gateways_res)
-    firewall_locs  = set(getattr(fw, "location", None) for fw in firewalls if getattr(fw, "location", None))
+    gateway_rg_loc = set((_id_to_rg(g.id), getattr(g, "location", None)) for g in gateways_res)
+    firewall_locs = set(getattr(fw, "location", None) for fw in firewalls if getattr(fw, "location", None))
 
     # VNets (list_all is available)
     vnets_iter = nclient.virtual_networks.list_all()
@@ -83,7 +90,7 @@ def get_network_details(subscription_id: str, credential, max_vnets: int = 50) -
 
     for v in vnets_iter:
         name = v.name
-        rg   = _id_to_rg(v.id)
+        rg = _id_to_rg(v.id)
         addr = (v.address_space.address_prefixes or []) if getattr(v, "address_space", None) else []
         location = v.location
 
@@ -100,29 +107,41 @@ def get_network_details(subscription_id: str, credential, max_vnets: int = 50) -
         subnets_out = []
         try:
             for sn in nclient.subnets.list(rg, name):
-                subnets_out.append({
-                    "name": sn.name,
-                    "nsg":  (sn.network_security_group.id.split("/")[-1] if (getattr(sn, "network_security_group", None) and sn.network_security_group.id) else "None"),
-                    "udr":  (sn.route_table.id.split("/")[-1] if (getattr(sn, "route_table", None) and sn.route_table.id) else "None"),
-                })
+                subnets_out.append(
+                    {
+                        "name": sn.name,
+                        "nsg": (
+                            sn.network_security_group.id.split("/")[-1]
+                            if (getattr(sn, "network_security_group", None) and sn.network_security_group.id)
+                            else "None"
+                        ),
+                        "udr": (
+                            sn.route_table.id.split("/")[-1]
+                            if (getattr(sn, "route_table", None) and sn.route_table.id)
+                            else "None"
+                        ),
+                    }
+                )
         except Exception:
             pass
 
         # Heuristic presence flags
-        has_gateway  = (rg, location) in gateway_rg_loc
+        has_gateway = (rg, location) in gateway_rg_loc
         has_firewall = location in firewall_locs
 
-        vnets.append({
-            "name": name,
-            "rg": rg,
-            "location": location,
-            "address_space": addr,
-            "peered": peered,
-            "peerings_count": peer_ct,
-            "subnets": subnets_out,
-            "has_gateway": has_gateway,
-            "has_firewall": has_firewall,
-        })
+        vnets.append(
+            {
+                "name": name,
+                "rg": rg,
+                "location": location,
+                "address_space": addr,
+                "peered": peered,
+                "peerings_count": peer_ct,
+                "subnets": subnets_out,
+                "has_gateway": has_gateway,
+                "has_firewall": has_firewall,
+            }
+        )
 
         if len(vnets) >= max_vnets:
             break
@@ -144,29 +163,13 @@ def get_network_details(subscription_id: str, credential, max_vnets: int = 50) -
         }
     }
 
-    return {
-        "summary": summary,
-        "vnets": vnets
-    }
+    return {"summary": summary, "vnets": vnets}
+
 
 def audit_virtual_networks(subscription_id: str, credential) -> Dict[str, Any]:
     """
-    Backwards-compatible: prints a simple audit to console AND returns structured data.
+    Backwards-compatible: returns structured data.
+
+    NOTE: Console printing removed to keep main.py output clean.
     """
-    data = get_network_details(subscription_id, credential, max_vnets=99999)
-
-    print("\nAuditing Virtual Networks:\n")
-    for v in data["vnets"]:
-        print(f"VNet: {v['name']}")
-        print(f"  RG: {v['rg']}")
-        print(f"  Location: {v['location']}")
-        print(f"  Address Space: {v['address_space']}")
-        print(f"  Peered: {'Yes' if v['peered'] else 'No'} (peerings: {v['peerings_count']})")
-        print(f"  Has VNet Gateway: {'Yes' if v['has_gateway'] else 'No'}")
-        print(f"  Has Azure Firewall (same location): {'Yes' if v['has_firewall'] else 'No'}")
-        print("  Subnets:")
-        for sn in v["subnets"]:
-            print(f"    - {sn['name']}: NSG = {sn['nsg']}, UDR = {sn['udr']}")
-        print("")
-
-    return data
+    return get_network_details(subscription_id, credential, max_vnets=99999)
