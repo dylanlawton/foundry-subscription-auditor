@@ -2,6 +2,7 @@
 
 from dotenv import load_dotenv
 import os
+import tempfile
 from datetime import datetime, timezone
 from azure.identity import InteractiveBrowserCredential
 
@@ -81,8 +82,9 @@ def _html_escape(s: str) -> str:
 
 
 def _write_text(path: str, text: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
-        f.write(text if text else "")
+        f.write(text)
 
 
 def _fmt_money(x) -> str:
@@ -532,15 +534,17 @@ td.narr {{ color:#111; }}
 # ============================
 
 def main() -> int:
-    # Keep console output clean: hide deprecation warnings unless debugging
     warnings.filterwarnings("ignore", category=DeprecationWarning)
-
     load_dotenv()
 
     subscription_id = os.getenv("AZURE_SUBSCRIPTION_ID")
     tenant_id = os.getenv("AZURE_TENANT_ID")
     SAMPLE_SIZE = int(os.getenv("SUBSCRIPTION_OVERVIEW_SAMPLE_SIZE", "5"))
-    OUTPUT_DIR = os.getenv("OUTPUT_DIR", "outputs")
+
+    # ✅ TEMP OUTPUT DEFAULT (still overridable by OUTPUT_DIR in .env)
+    default_out = os.path.join(tempfile.gettempdir(), "foundry-subscription-auditor")
+    OUTPUT_DIR = os.getenv("OUTPUT_DIR") or default_out
+
     MAX_VNETS = int(os.getenv("DETAIL_MAX_VNETS", "25"))
     MAX_RGS = int(os.getenv("DETAIL_MAX_RGS", "30"))
     MAX_VMS = int(os.getenv("DETAIL_MAX_VMS", "30"))
@@ -553,7 +557,6 @@ def main() -> int:
         print("Foundry Subscription Auditor | missing AZURE_SUBSCRIPTION_ID / AZURE_TENANT_ID")
         return 2
 
-    # Tidy single-line header
     print(f"Foundry Subscription Auditor | sub={subscription_id}\n")
 
     credential = InteractiveBrowserCredential(tenant_id=tenant_id)
@@ -564,7 +567,6 @@ def main() -> int:
     safe_sub = _safe_sub_id(subscription_id)
     html_path = os.path.join(OUTPUT_DIR, f"subscription_overview_{safe_sub}_{file_stamp}.html")
 
-    # Track outcomes
     inv_ok = False
     narr_ok = False
     gov_ok = False
@@ -575,7 +577,6 @@ def main() -> int:
     net_ok = False
     rg_ok = False
 
-    # ---- Inventory ----
     rows = []
     per_type_notes = {}
     try:
@@ -584,7 +585,6 @@ def main() -> int:
     except Exception:
         rows = []
 
-    # ---- Per-type narratives ----
     try:
         per_type_notes = describe_resource_types(rows) if rows else {}
         narr_ok = True
@@ -592,7 +592,6 @@ def main() -> int:
         per_type_notes = {}
         narr_ok = False
 
-    # ---- Governance/Security/Cost ----
     gsc_data = {}
     try:
         gsc_data = get_governance_security_cost_details(subscription_id, tenant_id, credential)
@@ -601,7 +600,6 @@ def main() -> int:
         cost_note = (gsc_data.get("cost", {}) or {}).get("note", "") or ""
         def_note = (gsc_data.get("defender", {}) or {}).get("note", "") or ""
 
-        # treat "ok" only if it isn't just "SDK missing"
         cost_ok = (not _is_sdk_missing(cost_note)) and ("failed" not in cost_note.lower())
         def_ok = (not _is_sdk_missing(def_note)) and ("failed" not in def_note.lower())
     except Exception:
@@ -610,7 +608,6 @@ def main() -> int:
         cost_ok = False
         def_ok = False
 
-    # ---- Detailed data ----
     vm_data = {}
     storage_data = {}
     net_data = {}
@@ -644,7 +641,6 @@ def main() -> int:
         rg_data = {}
         rg_ok = False
 
-    # ---- AI summaries ----
     try:
         if rows:
             ai_summary = analyze_subscription_resources_overview({
@@ -682,7 +678,6 @@ def main() -> int:
     except Exception as e:
         rg_ai = f"(RG AI narrative unavailable: {e})"
 
-    # ---- Render ----
     report_html = _render_html_report(
         subscription_id, rows, per_type_notes,
         ai_summary, gsc_ai, vm_ai, net_ai, rg_ai, storage_ai,
@@ -691,11 +686,9 @@ def main() -> int:
     )
     _write_text(html_path, report_html)
 
-    # ---- Tidy console summary ----
     _line("Inventory:", "OK" if inv_ok else "FAIL", "(ARM fallback if ARG unavailable)" if inv_ok else "")
     _line("Narratives:", "OK" if narr_ok else "FAIL")
 
-    # Show Cost/Defender status more accurately
     cost_status = "OK" if cost_ok else "SKIP (SDK)" if _is_sdk_missing((gsc_data.get("cost", {}) or {}).get("note", "")) else "WARN"
     def_status = "OK" if def_ok else "SKIP (SDK)" if _is_sdk_missing((gsc_data.get("defender", {}) or {}).get("note", "")) else "WARN"
 
