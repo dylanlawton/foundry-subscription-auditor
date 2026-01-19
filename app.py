@@ -11,12 +11,12 @@ Auth model:
 Goal:
 - Use the signed-in user's identity to call Azure Resource Manager (ARM)
   and list subscriptions the user can see.
-- Provide a /run endpoint that calls your shared audit engine (audit_runner.py).
+- Provide /subscriptions/simple for a clean, UI-friendly list.
+- Provide /run to call your shared audit engine (audit_runner.py).
 
-Implementation:
-- Try ARM call with Easy Auth access token (may fail if token audience is Graph)
-- If it fails, do OBO (On-Behalf-Of) using MSAL confidential client:
-  exchange the user's token for an ARM-scoped token.
+OBO (On-Behalf-Of):
+- If the Easy Auth access token is wrong audience (often Graph) or expired,
+  we exchange the user's token for an ARM-scoped token using MSAL.
 
 Required App Settings (for OBO):
 - AZURE_TENANT_ID
@@ -41,7 +41,7 @@ import msal
 import requests
 from flask import Flask, jsonify, request
 
-# These are Step-2 files you add to the repo:
+# Step-2 files (in your repo):
 # - token_credential.py (StaticTokenCredential)
 # - audit_runner.py (run_audit)
 from token_credential import StaticTokenCredential
@@ -84,6 +84,12 @@ def get_easy_auth_access_token() -> Optional[str]:
 
 def get_easy_auth_id_token() -> Optional[str]:
     return request.headers.get("X-MS-TOKEN-AAD-ID-TOKEN")
+
+
+def body_snippet(text: str, limit: int = 600) -> str:
+    if not text:
+        return ""
+    return text[:limit]
 
 
 def try_list_subscriptions_with_token(access_token: str) -> requests.Response:
@@ -129,20 +135,13 @@ def obo_arm_token(user_assertion_jwt: str) -> Tuple[Optional[str], Optional[Dict
     if "access_token" in result:
         return result["access_token"], None
 
-    # Return the full MSAL error payload for troubleshooting
     return None, result
-
-
-def body_snippet(text: str, limit: int = 600) -> str:
-    if not text:
-        return ""
-    return text[:limit]
 
 
 def get_arm_token_for_request() -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
     """
     Always try to obtain a valid ARM-scoped token for the signed-in user.
-    Prefer ID token as the OBO assertion (works well with Easy Auth); fall back to access token.
+    Prefer ID token as the OBO assertion; fall back to access token.
     """
     user_assertion = get_easy_auth_id_token() or get_easy_auth_access_token()
     if not user_assertion:
@@ -150,22 +149,42 @@ def get_arm_token_for_request() -> Tuple[Optional[str], Optional[Dict[str, Any]]
     return obo_arm_token(user_assertion)
 
 
+def normalize_subscriptions(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Convert ARM subscriptions payload into a UI-friendly structure.
+    """
+    items = payload.get("value", []) or []
+    simple = []
+    for s in items:
+        simple.append(
+            {
+                "subscriptionId": s.get("subscriptionId"),
+                "displayName": s.get("displayName"),
+                "state": s.get("state"),
+                "tenantId": s.get("tenantId"),
+            }
+        )
+
+    enabled = [x for x in simple if (x.get("state") or "").lower() == "enabled"]
+
+    return {
+        "count": len(simple),
+        "enabled_count": len(enabled),
+        "subscriptions": simple,
+        "enabled_subscriptions": enabled,
+    }
+
+
 # ----------------------------
 # Routes
 # ----------------------------
 @app.get("/")
 def health():
-    """
-    Simple health endpoint.
-    """
     return jsonify({"status": "ok"})
 
 
 @app.get("/whoami")
 def whoami():
-    """
-    Shows Easy Auth principal + whether relevant headers exist.
-    """
     principal = decode_easy_auth_principal()
     return jsonify(
         {
@@ -176,10 +195,7 @@ def whoami():
                 "X-MS-TOKEN-AAD-ID-TOKEN": bool(get_easy_auth_id_token()),
             },
             "principal": principal,
-            "tips": {
-                "logout_url": "/.auth/logout",
-                "login_hint": "If tokens look stale, open /.auth/logout then refresh /whoami.",
-            },
+            "tips": {"logout_url": "/.auth/logout"},
         }
     )
 
@@ -187,14 +203,12 @@ def whoami():
 @app.get("/subscriptions")
 def subscriptions():
     """
-    List subscriptions visible to the signed-in user.
-
-    Step 1: try Easy Auth access token directly (often Graph audience -> fails)
+    Raw-ish subscription listing. Still handy for debugging.
+    Step 1: try Easy Auth access token directly (often wrong audience -> fails)
     Step 2: do OBO to ARM and retry
     """
     first_attempt: Dict[str, Any] = {}
 
-    # 1) Try Easy Auth access token directly
     easy_access = get_easy_auth_access_token()
     if easy_access:
         r = try_list_subscriptions_with_token(easy_access)
@@ -209,7 +223,6 @@ def subscriptions():
     else:
         first_attempt = {"error": "No X-MS-TOKEN-AAD-ACCESS-TOKEN header present."}
 
-    # 2) OBO fallback
     arm_token, obo_error = get_arm_token_for_request()
     if not arm_token:
         return (
@@ -238,14 +251,39 @@ def subscriptions():
                 "error": "ARM call failed even after OBO.",
                 "first_attempt": first_attempt,
                 "obo_attempt": {"status_code": r2.status_code, "body_snippet": body_snippet(r2.text)},
-                "next_steps": [
-                    "Check user RBAC to subscriptions (Reader or above).",
-                    "If 401, verify scope/audience and that Entra app is configured correctly.",
-                ],
             }
         ),
         r2.status_code,
     )
+
+
+@app.get("/subscriptions/simple")
+def subscriptions_simple():
+    """
+    UI-friendly subscription list:
+    - subscriptionId
+    - displayName
+    - state
+    - tenantId
+    """
+    arm_token, obo_error = get_arm_token_for_request()
+    if not arm_token:
+        return jsonify({"error": "Could not obtain ARM token", "details": obo_error}), 401
+
+    r = try_list_subscriptions_with_token(arm_token)
+    if r.status_code != 200:
+        return (
+            jsonify(
+                {
+                    "error": "ARM subscriptions call failed",
+                    "status_code": r.status_code,
+                    "body_snippet": body_snippet(r.text),
+                }
+            ),
+            r.status_code,
+        )
+
+    return jsonify(normalize_subscriptions(r.json()))
 
 
 @app.post("/run")
@@ -256,10 +294,8 @@ def run():
     Request body:
       {
         "subscriptionId": "<guid>",
-        "outputDir": "/tmp/outputs"   # optional, defaults to /tmp/outputs
+        "outputDir": "/tmp/outputs"   # optional
       }
-
-    Returns JSON results (v1). Next iteration can generate HTML and provide a download link.
     """
     body = request.get_json(silent=True) or {}
     subscription_id = body.get("subscriptionId") or body.get("subscription_id")
@@ -271,14 +307,11 @@ def run():
         return jsonify({"error": "Could not obtain ARM token via OBO", "details": obo_error}), 401
 
     credential = StaticTokenCredential(arm_token)
-
     output_dir = body.get("outputDir") or body.get("output_dir") or "/tmp/outputs"
 
-    # Shared engine call (same function your CLI main.py will call)
     results = run_audit(
         subscription_id=subscription_id,
         credential=credential,
         output_dir=output_dir,
     )
-
     return jsonify(results)
