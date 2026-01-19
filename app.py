@@ -11,16 +11,20 @@ Auth model:
 Goal:
 - Use the signed-in user's identity to call Azure Resource Manager (ARM)
   and list subscriptions the user can see.
+- Provide a /run endpoint that calls your shared audit engine (audit_runner.py).
 
 Implementation:
 - Try ARM call with Easy Auth access token (may fail if token audience is Graph)
 - If it fails, do OBO (On-Behalf-Of) using MSAL confidential client:
   exchange the user's token for an ARM-scoped token.
 
-Required App Settings (for OBO fallback):
+Required App Settings (for OBO):
 - AZURE_TENANT_ID
 - AZURE_CLIENT_ID
 - AZURE_CLIENT_SECRET
+
+Build setting:
+- SCM_DO_BUILD_DURING_DEPLOYMENT=1
 
 Startup command (App Service → Stack settings):
 - gunicorn --bind=0.0.0.0:8000 app:app
@@ -36,6 +40,12 @@ from typing import Any, Dict, Optional, Tuple
 import msal
 import requests
 from flask import Flask, jsonify, request
+
+# These are Step-2 files you add to the repo:
+# - token_credential.py (StaticTokenCredential)
+# - audit_runner.py (run_audit)
+from token_credential import StaticTokenCredential
+from audit_runner import run_audit
 
 app = Flask(__name__)
 
@@ -129,6 +139,17 @@ def body_snippet(text: str, limit: int = 600) -> str:
     return text[:limit]
 
 
+def get_arm_token_for_request() -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
+    """
+    Always try to obtain a valid ARM-scoped token for the signed-in user.
+    Prefer ID token as the OBO assertion (works well with Easy Auth); fall back to access token.
+    """
+    user_assertion = get_easy_auth_id_token() or get_easy_auth_access_token()
+    if not user_assertion:
+        return None, {"error": "No Easy Auth token headers present for OBO."}
+    return obo_arm_token(user_assertion)
+
+
 # ----------------------------
 # Routes
 # ----------------------------
@@ -189,20 +210,7 @@ def subscriptions():
         first_attempt = {"error": "No X-MS-TOKEN-AAD-ACCESS-TOKEN header present."}
 
     # 2) OBO fallback
-    # Prefer ID token as assertion; if not present, fall back to access token.
-    user_assertion = get_easy_auth_id_token() or get_easy_auth_access_token()
-    if not user_assertion:
-        return (
-            jsonify(
-                {
-                    "error": "No user token available from Easy Auth headers for OBO.",
-                    "first_attempt": first_attempt,
-                }
-            ),
-            401,
-        )
-
-    arm_token, obo_error = obo_arm_token(user_assertion)
+    arm_token, obo_error = get_arm_token_for_request()
     if not arm_token:
         return (
             jsonify(
@@ -238,3 +246,39 @@ def subscriptions():
         ),
         r2.status_code,
     )
+
+
+@app.post("/run")
+def run():
+    """
+    Run the audit engine for a selected subscription.
+
+    Request body:
+      {
+        "subscriptionId": "<guid>",
+        "outputDir": "/tmp/outputs"   # optional, defaults to /tmp/outputs
+      }
+
+    Returns JSON results (v1). Next iteration can generate HTML and provide a download link.
+    """
+    body = request.get_json(silent=True) or {}
+    subscription_id = body.get("subscriptionId") or body.get("subscription_id")
+    if not subscription_id:
+        return jsonify({"error": "Missing subscriptionId"}), 400
+
+    arm_token, obo_error = get_arm_token_for_request()
+    if not arm_token:
+        return jsonify({"error": "Could not obtain ARM token via OBO", "details": obo_error}), 401
+
+    credential = StaticTokenCredential(arm_token)
+
+    output_dir = body.get("outputDir") or body.get("output_dir") or "/tmp/outputs"
+
+    # Shared engine call (same function your CLI main.py will call)
+    results = run_audit(
+        subscription_id=subscription_id,
+        credential=credential,
+        output_dir=output_dir,
+    )
+
+    return jsonify(results)
