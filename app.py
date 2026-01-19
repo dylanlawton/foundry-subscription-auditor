@@ -36,6 +36,9 @@ app = Flask(__name__)
 
 ARM_SUBS_URL = "https://management.azure.com/subscriptions?api-version=2020-01-01"
 
+# NEW: simple version stamp (set APP_VERSION in App Settings if you want)
+APP_VERSION = os.getenv("APP_VERSION", "2.1-option-b")
+
 
 # ----------------------------
 # Helpers
@@ -165,7 +168,7 @@ def _read_json(p: Path) -> Optional[Dict[str, Any]]:
 # ----------------------------
 @app.get("/")
 def health():
-    return jsonify({"status": "ok"})
+    return jsonify({"status": "ok", "version": APP_VERSION})
 
 
 @app.get("/whoami")
@@ -173,6 +176,7 @@ def whoami():
     principal = decode_easy_auth_principal()
     return jsonify(
         {
+            "version": APP_VERSION,
             "is_azure": bool(_env("WEBSITE_INSTANCE_ID")),
             "headers_present": {
                 "X-MS-CLIENT-PRINCIPAL": bool(request.headers.get("X-MS-CLIENT-PRINCIPAL")),
@@ -289,6 +293,7 @@ def run_async():
                 "status": "running",
                 "poll": f"/run/{run_id}",
                 "output_dir": str(run_path),
+                "version": APP_VERSION,
             }
         ),
         202,
@@ -301,16 +306,14 @@ def run_status(run_id: str):
     Poll endpoint for Option B.
     Returns status.json always; includes result.json when present.
     """
-    # Try default outputs root first; if you override OUTPUTS_ROOT, this still works
     base = _outputs_root()
-    # If you used outputDir override, run_id includes enough to search; keep it simple and assume defaults
     status_path = base / run_id / "status.json"
     result_path = base / run_id / "result.json"
 
     status = _read_json(status_path)
     if not status:
-        return jsonify({"error": "run_id not found", "run_id": run_id}), 404
+        return jsonify({"error": "run_id not found", "run_id": run_id, "version": APP_VERSION}), 404
 
     result = _read_json(result_path)
-    payload = {"status": status, "result": result}
+    payload = {"status": status, "result": result, "version": APP_VERSION}
     return jsonify(payload)
