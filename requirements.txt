@@ -22,3 +22,14 @@ azure-monitor-query
 
 # AI (leave as-is)
 openai
+
+#WebApp
+fastapi
+uvicorn[standard]
+msal
+httpx
+itsdangerous
+python-multipart
+flask
+gunicorn
+requests
