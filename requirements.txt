@@ -1,35 +1,28 @@
 # Core
 python-dotenv
+requests
+msal
+flask
+gunicorn
+
+# Identity
 azure-identity
 
-# Resource & inventory (includes Policy APIs)
+# Azure inventory / resource APIs
 azure-mgmt-resource
 azure-mgmt-resourcegraph
 azure-mgmt-managementgroups
 
-# Compute / network / storage
+# Compute / network / storage / monitor
 azure-mgmt-compute
 azure-mgmt-network
 azure-mgmt-storage
 azure-mgmt-monitor
+azure-monitor-query
 
 # Cost & security
 azure-mgmt-costmanagement
 azure-mgmt-security
 
-# Monitoring / metrics
-azure-monitor-query
-
-# AI (leave as-is)
+# AI
 openai
-
-#WebApp
-fastapi
-uvicorn[standard]
-msal
-httpx
-itsdangerous
-python-multipart
-flask
-gunicorn
-requests

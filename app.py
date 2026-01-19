@@ -9,25 +9,9 @@ Auth model:
   - X-MS-TOKEN-AAD-ACCESS-TOKEN
 
 Goal:
-- Use the signed-in user's identity to call Azure Resource Manager (ARM)
-  and list subscriptions the user can see.
-- Provide /subscriptions/simple for a clean, UI-friendly list.
-- Provide /run to call your shared audit engine (audit_runner.py).
-
-OBO (On-Behalf-Of):
-- If the Easy Auth access token is wrong audience (often Graph) or expired,
-  we exchange the user's token for an ARM-scoped token using MSAL.
-
-Required App Settings (for OBO):
-- AZURE_TENANT_ID
-- AZURE_CLIENT_ID
-- AZURE_CLIENT_SECRET
-
-Build setting:
-- SCM_DO_BUILD_DURING_DEPLOYMENT=1
-
-Startup command (App Service → Stack settings):
-- gunicorn --bind=0.0.0.0:8000 app:app
+- Use signed-in user identity to call ARM and list subscriptions.
+- Provide /subscriptions/simple for UI list.
+- Provide /run (Option B): async audit run returning run_id + poll endpoint.
 """
 
 from __future__ import annotations
@@ -35,15 +19,16 @@ from __future__ import annotations
 import base64
 import json
 import os
+import threading
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
 import msal
 import requests
 from flask import Flask, jsonify, request
 
-# Step-2 files (in your repo):
-# - token_credential.py (StaticTokenCredential)
-# - audit_runner.py (run_audit)
 from token_credential import StaticTokenCredential
 from audit_runner import run_audit
 
@@ -55,15 +40,16 @@ ARM_SUBS_URL = "https://management.azure.com/subscriptions?api-version=2020-01-0
 # ----------------------------
 # Helpers
 # ----------------------------
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
 def _env(name: str, default: Optional[str] = None) -> Optional[str]:
     v = os.getenv(name)
     return v if v not in ("", None) else default
 
 
 def decode_easy_auth_principal() -> Optional[Dict[str, Any]]:
-    """
-    Decode X-MS-CLIENT-PRINCIPAL which is base64 JSON.
-    """
     b64 = request.headers.get("X-MS-CLIENT-PRINCIPAL")
     if not b64:
         return None
@@ -87,23 +73,14 @@ def get_easy_auth_id_token() -> Optional[str]:
 
 
 def body_snippet(text: str, limit: int = 600) -> str:
-    if not text:
-        return ""
-    return text[:limit]
+    return (text or "")[:limit]
 
 
 def try_list_subscriptions_with_token(access_token: str) -> requests.Response:
-    """
-    Call ARM list subscriptions with a given bearer token.
-    """
     return requests.get(ARM_SUBS_URL, headers=bearer(access_token), timeout=30)
 
 
 def obo_arm_token(user_assertion_jwt: str) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
-    """
-    On-Behalf-Of flow: exchange the user's token for an ARM token.
-    Returns (access_token, error_dict).
-    """
     tenant_id = _env("AZURE_TENANT_ID")
     client_id = _env("AZURE_CLIENT_ID")
     client_secret = _env("AZURE_CLIENT_SECRET")
@@ -126,7 +103,6 @@ def obo_arm_token(user_assertion_jwt: str) -> Tuple[Optional[str], Optional[Dict
         client_credential=client_secret,
     )
 
-    # Request ARM scope
     result = cca.acquire_token_on_behalf_of(
         user_assertion=user_assertion_jwt,
         scopes=["https://management.azure.com/.default"],
@@ -139,10 +115,6 @@ def obo_arm_token(user_assertion_jwt: str) -> Tuple[Optional[str], Optional[Dict
 
 
 def get_arm_token_for_request() -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
-    """
-    Always try to obtain a valid ARM-scoped token for the signed-in user.
-    Prefer ID token as the OBO assertion; fall back to access token.
-    """
     user_assertion = get_easy_auth_id_token() or get_easy_auth_access_token()
     if not user_assertion:
         return None, {"error": "No Easy Auth token headers present for OBO."}
@@ -150,29 +122,42 @@ def get_arm_token_for_request() -> Tuple[Optional[str], Optional[Dict[str, Any]]
 
 
 def normalize_subscriptions(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Convert ARM subscriptions payload into a UI-friendly structure.
-    """
     items = payload.get("value", []) or []
-    simple = []
-    for s in items:
-        simple.append(
-            {
-                "subscriptionId": s.get("subscriptionId"),
-                "displayName": s.get("displayName"),
-                "state": s.get("state"),
-                "tenantId": s.get("tenantId"),
-            }
-        )
-
+    simple = [
+        {
+            "subscriptionId": s.get("subscriptionId"),
+            "displayName": s.get("displayName"),
+            "state": s.get("state"),
+            "tenantId": s.get("tenantId"),
+        }
+        for s in items
+    ]
     enabled = [x for x in simple if (x.get("state") or "").lower() == "enabled"]
-
     return {
         "count": len(simple),
         "enabled_count": len(enabled),
         "subscriptions": simple,
         "enabled_subscriptions": enabled,
     }
+
+
+def _outputs_root() -> Path:
+    return Path(_env("OUTPUTS_ROOT", "/tmp/outputs"))
+
+
+def _run_dir(run_id: str) -> Path:
+    return _outputs_root() / run_id
+
+
+def _write_json(p: Path, obj: Any) -> None:
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps(obj, indent=2), encoding="utf-8")
+
+
+def _read_json(p: Path) -> Optional[Dict[str, Any]]:
+    if not p.exists():
+        return None
+    return json.loads(p.read_text(encoding="utf-8"))
 
 
 # ----------------------------
@@ -200,72 +185,8 @@ def whoami():
     )
 
 
-@app.get("/subscriptions")
-def subscriptions():
-    """
-    Raw-ish subscription listing. Still handy for debugging.
-    Step 1: try Easy Auth access token directly (often wrong audience -> fails)
-    Step 2: do OBO to ARM and retry
-    """
-    first_attempt: Dict[str, Any] = {}
-
-    easy_access = get_easy_auth_access_token()
-    if easy_access:
-        r = try_list_subscriptions_with_token(easy_access)
-        if r.status_code == 200:
-            return jsonify({"source": "easy_auth_access_token", **r.json()})
-
-        first_attempt = {
-            "status_code": r.status_code,
-            "body_snippet": body_snippet(r.text),
-            "note": "Easy Auth access token failed for ARM (often wrong audience or expired).",
-        }
-    else:
-        first_attempt = {"error": "No X-MS-TOKEN-AAD-ACCESS-TOKEN header present."}
-
-    arm_token, obo_error = get_arm_token_for_request()
-    if not arm_token:
-        return (
-            jsonify(
-                {
-                    "error": "ARM token not available (OBO failed).",
-                    "first_attempt": first_attempt,
-                    "obo_error": obo_error,
-                    "next_steps": [
-                        "Confirm AZURE_TENANT_ID/AZURE_CLIENT_ID/AZURE_CLIENT_SECRET are set in App Settings.",
-                        "Confirm API permissions include 'Azure Service Management' delegated 'user_impersonation' and consent is granted.",
-                        "Try /.auth/logout then re-login to refresh user tokens.",
-                    ],
-                }
-            ),
-            500,
-        )
-
-    r2 = try_list_subscriptions_with_token(arm_token)
-    if r2.status_code == 200:
-        return jsonify({"source": "obo_arm_token", **r2.json()})
-
-    return (
-        jsonify(
-            {
-                "error": "ARM call failed even after OBO.",
-                "first_attempt": first_attempt,
-                "obo_attempt": {"status_code": r2.status_code, "body_snippet": body_snippet(r2.text)},
-            }
-        ),
-        r2.status_code,
-    )
-
-
 @app.get("/subscriptions/simple")
 def subscriptions_simple():
-    """
-    UI-friendly subscription list:
-    - subscriptionId
-    - displayName
-    - state
-    - tenantId
-    """
     arm_token, obo_error = get_arm_token_for_request()
     if not arm_token:
         return jsonify({"error": "Could not obtain ARM token", "details": obo_error}), 401
@@ -287,14 +208,16 @@ def subscriptions_simple():
 
 
 @app.post("/run")
-def run():
+def run_async():
     """
-    Run the audit engine for a selected subscription.
+    OPTION B (async):
+    - POST /run starts a run and immediately returns run_id (202 Accepted)
+    - GET /run/<run_id> returns status/results
 
-    Request body:
+    Body:
       {
         "subscriptionId": "<guid>",
-        "outputDir": "/tmp/outputs"   # optional
+        "outputDir": "/tmp/outputs"  # optional override
       }
     """
     body = request.get_json(silent=True) or {}
@@ -306,12 +229,88 @@ def run():
     if not arm_token:
         return jsonify({"error": "Could not obtain ARM token via OBO", "details": obo_error}), 401
 
-    credential = StaticTokenCredential(arm_token)
-    output_dir = body.get("outputDir") or body.get("output_dir") or "/tmp/outputs"
+    # Create run
+    run_id = f"{subscription_id}_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+    out_root = Path(body.get("outputDir") or body.get("output_dir") or str(_outputs_root()))
+    run_path = out_root / run_id
 
-    results = run_audit(
-        subscription_id=subscription_id,
-        credential=credential,
-        output_dir=output_dir,
+    status_path = run_path / "status.json"
+    result_path = run_path / "result.json"
+
+    _write_json(
+        status_path,
+        {
+            "run_id": run_id,
+            "subscription_id": subscription_id,
+            "status": "running",
+            "started_utc": _utc_now(),
+        },
     )
-    return jsonify(results)
+
+    def _worker():
+        try:
+            credential = StaticTokenCredential(arm_token)
+            results = run_audit(
+                subscription_id=subscription_id,
+                credential=credential,
+                output_dir=str(run_path),
+            )
+            _write_json(result_path, results)
+            _write_json(
+                status_path,
+                {
+                    "run_id": run_id,
+                    "subscription_id": subscription_id,
+                    "status": "succeeded",
+                    "started_utc": _read_json(status_path).get("started_utc") if _read_json(status_path) else None,
+                    "finished_utc": _utc_now(),
+                },
+            )
+        except Exception as e:
+            _write_json(
+                status_path,
+                {
+                    "run_id": run_id,
+                    "subscription_id": subscription_id,
+                    "status": "failed",
+                    "finished_utc": _utc_now(),
+                    "error": str(e),
+                },
+            )
+
+    t = threading.Thread(target=_worker, daemon=True)
+    t.start()
+
+    return (
+        jsonify(
+            {
+                "run_id": run_id,
+                "subscription_id": subscription_id,
+                "status": "running",
+                "poll": f"/run/{run_id}",
+                "output_dir": str(run_path),
+            }
+        ),
+        202,
+    )
+
+
+@app.get("/run/<run_id>")
+def run_status(run_id: str):
+    """
+    Poll endpoint for Option B.
+    Returns status.json always; includes result.json when present.
+    """
+    # Try default outputs root first; if you override OUTPUTS_ROOT, this still works
+    base = _outputs_root()
+    # If you used outputDir override, run_id includes enough to search; keep it simple and assume defaults
+    status_path = base / run_id / "status.json"
+    result_path = base / run_id / "result.json"
+
+    status = _read_json(status_path)
+    if not status:
+        return jsonify({"error": "run_id not found", "run_id": run_id}), 404
+
+    result = _read_json(result_path)
+    payload = {"status": status, "result": result}
+    return jsonify(payload)
