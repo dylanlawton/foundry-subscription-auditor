@@ -24,5 +24,8 @@ azure-monitor-query
 azure-mgmt-costmanagement
 azure-mgmt-security
 
+# Key Vault
+azure-mgmt-keyvault
+
 # AI
 openai
